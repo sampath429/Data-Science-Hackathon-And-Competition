@@ -1,22 +1,17 @@
 """
 src/orchestrator.py
-The main orchestration logic for the Salesforce Service Agent.
-Coordinates Ingress, Context Gathering, Analysis, and Egress.
+The main workflow controller for the Salesforce Service Agent.
+Coordinates the 'Closed-Loop' logic: Ingress Context -> RAG Analysis -> Egress.
 """
 
-import asyncio
 import logging
 import httpx
-from config import settings
-from sf_client import SalesforceClient
-from rag_engine import RAGEngine
+from src.config import settings
+from src.sf_client import SalesforceClient
+from src.rag_engine import RAGEngine
 from schemas.models import TechnicalAnalysis
 
-# Initialize structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+# Configure logging
 logger = logging.getLogger(__name__)
 
 class ServiceAgentOrchestrator:
@@ -26,80 +21,73 @@ class ServiceAgentOrchestrator:
 
     async def _alert_critical_sentiment(self, analysis: TechnicalAnalysis):
         """
-        Egress: Posts a notification to Slack/Teams if sentiment is 'Critical'.
+        EGRESS: External Notification
+        Posts a structured alert to Microsoft Teams/Slack if a safety risk is detected.
         """
-        logger.warning(f"CRITICAL SENTIMENT DETECTED for Case {analysis.case_id}")
+        logger.warning(f"CRITICAL FAULT DETECTED: Case {analysis.case_id}")
         
+        # Formatting the payload for Teams/Slack Webhooks
         payload = {
             "text": (
-                f"🚨 *Critical Technical Fault Identified*\n"
-                f"*Case ID:* {analysis.case_id}\n"
-                f"*Likely Solution:* {analysis.likely_solution}\n"
-                f"*Confidence:* {analysis.confidence_score * 100}%\n"
-                f"Please review the Salesforce Task assigned to the technician."
+                f"🚨 *CRITICAL SAFETY ALERT*\n"
+                f"**Case ID:** {analysis.case_id}\n"
+                f"**Sentiment:** {analysis.sentiment}\n"
+                f"**Suggested Action:** {analysis.likely_solution}\n"
+                f"**Confidence:** {analysis.confidence_score * 100}%\n"
+                f"--- \n"
+                f"A high-priority Task has been created for the Lead Technician."
             )
         }
 
         async with httpx.AsyncClient() as client:
             try:
+                # We use the notification URL from our centralized config
                 response = await client.post(settings.notif_webhook_url, json=payload)
                 response.raise_for_status()
-                logger.info("Notification successfully sent to external channel.")
+                logger.info("External critical notification sent successfully.")
             except Exception as e:
-                logger.error(f"Failed to send critical notification: {e}")
+                # We log this but don't 'raise' it. 
+                # We don't want a notification failure to roll back the Salesforce update.
+                logger.error(f"External notification failed: {e}")
 
     async def run_closed_loop(self, case_id: str):
         """
-        Executes the full automated workflow.
-        Ensures state persistence via exception raising (for Queue retries).
+        The Core Loop Execution:
+        1. Authenticate with Salesforce.
+        2. Gather Context (Data Traversal).
+        3. Analyze via RAG (Intelligence).
+        4. Write-back to Salesforce (Egress).
+        5. Trigger Alert if Critical (Egress).
         """
         try:
             # 1. AUTHENTICATION
-            # In production, this would use Cached tokens from Redis/CosmosDB
+            # Ensures we have a valid Bearer token for this execution run
             await self.sf_client.authenticate()
 
             # 2. INGRESS & CONTEXT GATHERING
-            logger.info(f"Gathering context for Case: {case_id}")
+            # Traverses Salesforce relationships to get Case + Vehicle History
             case_context = await self.sf_client.fetch_case_context(case_id)
 
             # 3. ANALYSIS (RAG)
-            logger.info("Starting RAG-based analysis phase...")
+            # Queries Azure Search and GPT-4o for a technical solution
             analysis_result = await self.rag_engine.analyze_case(case_context)
             
             # 4. EGRESS: SALESFORCE WRITE-BACK
-            logger.info("Performing Salesforce write-back...")
+            # Updates the Case record and creates a Technician Task
             await self.sf_client.write_back(
                 case_id=case_id,
                 summary=analysis_result.technical_summary
             )
 
             # 5. EGRESS: EXTERNAL NOTIFICATION
+            # Final check to see if we need to alert the human team immediately
             if analysis_result.sentiment.lower() == "critical":
                 await self._alert_critical_sentiment(analysis_result)
 
-            logger.info(f"Closed-loop operation completed successfully for Case {case_id}.")
+            logger.info(f"Successfully closed the loop for Case {case_id}")
 
-        except httpx.HTTPStatusError as e:
-            # STATE PERSISTENCE LOGIC:
-            # If Salesforce (or any API) is down, we log and raise the error.
-            # When deployed as an Azure Function with a Service Bus trigger, 
-            # raising this exception causes the message to be retried automatically.
-            logger.error(f"Network error during execution: {e.response.status_code} - {e.response.text}")
-            raise 
         except Exception as e:
-            logger.critical(f"Unrecoverable error in orchestrator: {str(e)}")
-            raise
-
-async def main():
-    """
-    Entry point for manual testing.
-    In production, this would be replaced by an Azure Function trigger.
-    """
-    # Replace with a valid Salesforce Case ID for integration testing
-    test_case_id = "500xx00000xxxx" 
-    
-    orchestrator = ServiceAgentOrchestrator()
-    await orchestrator.run_closed_loop(test_case_id)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            # CRITICAL: We raise the error here so the 'worker.py' knows
+            # to keep the message in the Service Bus for a retry.
+            logger.error(f"Error in Orchestration Loop for Case {case_id}: {str(e)}")
+            raise e

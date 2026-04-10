@@ -1,16 +1,14 @@
 """
 src/sf_client.py
-Handles Salesforce authentication and REST API operations.
-Integrates with Azure Key Vault for secret management.
+Handles Salesforce authentication, complex data retrieval, and write-backs.
+Uses httpx for high-performance async I/O.
 """
 
 import httpx
 import logging
-from typing import Dict, Any
-from azure.identity.aio import DefaultAzureCredential
-from azure.keyvault.secrets.aio import SecretClient
-from config import settings
-from schemas.models import SalesforceCase, SalesforceCustomer, VehicleHistory
+from typing import Dict, Any, Optional
+from src.config import settings
+from schemas.models import SalesforceCase, VehicleHistory
 
 logger = logging.getLogger(__name__)
 
@@ -18,41 +16,38 @@ class SalesforceClient:
     def __init__(self):
         self.api_version = "v59.0"
         self.base_url = f"{settings.sf_instance_url}/services/data/{self.api_version}"
-        self._access_token: str | None = None
-
-    async def _get_vault_secret(self, secret_name: str) -> str:
-        """Fetches Client ID/Secret from Azure Key Vault."""
-        async with DefaultAzureCredential() as credential:
-            client = SecretClient(vault_url=settings.vault_url, credential=credential)
-            secret = await client.get_secret(secret_name)
-            return secret.value
+        self._access_token: Optional[str] = None
 
     async def authenticate(self):
         """
-        Authenticates via OAuth2 Client Credentials flow.
-        Secrets are pulled dynamically from Azure Key Vault.
+        Authenticates via OAuth 2.0 Client Credentials flow.
+        Retrieves secrets via the config singleton (Settings).
         """
-        logger.info("Authenticating with Salesforce via Azure Key Vault secrets...")
-        client_id = await self._get_vault_secret("SF-CLIENT-ID")
-        client_secret = await self._get_vault_secret("SF-CLIENT-SECRET")
-        
+        logger.info("Authenticating with Salesforce...")
         token_url = f"{settings.sf_instance_url}/services/oauth2/token"
+        
         payload = {
             "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret
+            "client_id": settings.sf_client_id,
+            "client_secret": settings.sf_client_secret
         }
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(token_url, data=payload)
-            response.raise_for_status()
-            self._access_token = response.json().get("access_token")
-            logger.info("Salesforce authentication successful.")
+            try:
+                response = await client.post(token_url, data=payload)
+                response.raise_for_status()
+                data = response.json()
+                self._access_token = data.get("access_token")
+                logger.info("Salesforce authentication successful.")
+            except httpx.HTTPStatusError as e:
+                logger.error(f"Auth failed: {e.response.status_code} - {e.response.text}")
+                raise
 
     @property
     def headers(self) -> Dict[str, str]:
+        """Helper to generate Auth headers for REST calls."""
         if not self._access_token:
-            raise RuntimeError("Access token missing. Call authenticate() first.")
+            raise RuntimeError("No access token. Call authenticate() first.")
         return {
             "Authorization": f"Bearer {self._access_token}",
             "Content-Type": "application/json"
@@ -60,54 +55,59 @@ class SalesforceClient:
 
     async def fetch_case_context(self, case_id: str) -> SalesforceCase:
         """
-        Context Gathering: Fetches Case and performs 'Data Traversal' 
-        to find related Vehicle History.
+        INGRESS/CONTEXT GATHERING:
+        1. Fetches the primary Case record.
+        2. Performs 'Data Traversal' to find related Vehicle History.
         """
         async with httpx.AsyncClient() as client:
-            # 1. Fetch Primary Case Data
+            # 1. Fetch Primary Case
             case_resp = await client.get(
                 f"{self.base_url}/sobjects/Case/{case_id}", 
                 headers=self.headers
             )
             case_resp.raise_for_status()
-            case_raw = case_resp.json()
+            case_data = case_resp.json()
 
-            # 2. Data Traversal: Fetch Vehicle History using Custom Field
-            # This demonstrates handling custom Salesforce objects (__c)
+            # 2. Data Traversal: Find history based on custom VIN field
+            vin = case_data.get("Vehicle_VIN__c")
             vehicle_history = None
-            vin = case_raw.get("Vehicle_VIN__c")
-            
+
             if vin:
+                logger.info(f"Traversing data for VIN: {vin}")
+                # SOQL Query to find custom object records
                 query = f"SELECT VIN__c, Last_Service_Date__c, Repair_Notes__c FROM Vehicle__c WHERE VIN__c='{vin}' LIMIT 1"
-                veh_resp = await client.get(
-                    f"{self.base_url}/query?q={query}", 
-                    headers=self.headers
-                )
+                query_url = f"{settings.sf_instance_url}/services/data/{self.api_version}/query?q={query}"
+                
+                veh_resp = await client.get(query_url, headers=self.headers)
                 records = veh_resp.json().get("records", [])
                 if records:
                     vehicle_history = VehicleHistory(**records[0])
 
-            # 3. Assemble the full Pydantic Context
+            # 3. Return a validated Pydantic model
             return SalesforceCase(
-                **case_raw,
+                case_id=case_id,
+                subject=case_data.get("Subject"),
+                description=case_data.get("Description"),
                 vehicle_history=vehicle_history
             )
 
     async def write_back(self, case_id: str, summary: str):
         """
-        Egress: Updates the Salesforce Case and creates a Task.
+        EGRESS: Updates the Case with AI results and creates a human Task.
+        This closes the loop.
         """
         async with httpx.AsyncClient() as client:
-            # Update Case Technical Summary field
-            logger.info(f"Updating Case {case_id} with technical summary...")
-            await client.patch(
+            # A. Update the Case technical field
+            update_payload = {"Technical_Summary__c": summary}
+            patch_resp = await client.patch(
                 f"{self.base_url}/sobjects/Case/{case_id}",
                 headers=self.headers,
-                json={"Technical_Summary__c": summary}
+                json=update_payload
             )
+            patch_resp.raise_for_status()
+            logger.info(f"Case {case_id} updated with AI summary.")
 
-            # Create Follow-up Task for a human technician
-            logger.info("Creating follow-up task in Salesforce...")
+            # B. Create a Follow-up Task for the technician
             task_payload = {
                 "Subject": "Review AI-Generated Repair Procedure",
                 "WhatId": case_id,
@@ -115,8 +115,10 @@ class SalesforceClient:
                 "Status": "Not Started",
                 "Priority": "High"
             }
-            await client.post(
+            task_resp = await client.post(
                 f"{self.base_url}/sobjects/Task",
                 headers=self.headers,
                 json=task_payload
             )
+            task_resp.raise_for_status()
+            logger.info(f"Technician Task created for Case {case_id}.")

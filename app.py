@@ -1,56 +1,94 @@
 """
 app.py
-The entry point for the Agent. Acts as the REST endpoint for Salesforce.
-Receives triggers and hands them off to the orchestrator.
+The Ingress point for the Salesforce Service Agent.
+Responsible for receiving webhooks, validating data, and persisting state.
 """
 
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
-from pydantic import BaseModel
-from src.orchestrator import ServiceAgentOrchestrator
-from src.config import settings
 import logging
+from fastapi import FastAPI, HTTPException, status, Depends
+from pydantic import BaseModel
+from azure.servicebus.aio import ServiceBusClient
+from azure.servicebus import ServiceBusMessage
+from src.config import settings
 
-# Initialize FastAPI app and Orchestrator
-app = FastAPI(title="Salesforce Service Agent API")
-orchestrator = ServiceAgentOrchestrator()
+# Initialize FastAPI
+app = FastAPI(
+    title="Salesforce Service Agent - Ingress API",
+    description="REST endpoint for Salesforce Record-Triggered Flows"
+)
 
-# Logging setup
+# Logging Configuration
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SalesforceTrigger(BaseModel):
-    """Schema for the incoming Salesforce webhook."""
+    """
+    Schema for the incoming Salesforce webhook payload.
+    Ensures Case ID is present before we even attempt to queue it.
+    """
     case_id: str
     priority: str = "High"
 
-@app.get("/health")
-async def health_check():
-    """Endpoint for Azure App Service health monitoring."""
-    return {"status": "healthy"}
+async def get_sb_client():
+    """Dependency to provide a Service Bus Client."""
+    client = ServiceBusClient.from_connection_string(
+        settings.sb_conn_str, 
+        logging_enable=False
+    )
+    try:
+        yield client
+    finally:
+        await client.close()
 
 @app.post("/trigger", status_code=status.HTTP_202_ACCEPTED)
-async def handle_new_case(payload: SalesforceTrigger, background_tasks: BackgroundTasks):
+async def handle_salesforce_webhook(
+    payload: SalesforceTrigger, 
+    sb_client: ServiceBusClient = Depends(get_sb_client)
+):
     """
     Ingress Point: Receives Case ID from Salesforce.
-    The '202 Accepted' response is sent immediately to Salesforce 
-    to prevent timeout while the agent works in the background.
+    
+    Persistence Logic:
+    1. Validates the Case ID.
+    2. Pushes Case ID to Azure Service Bus (The 'Persistence Layer').
+    3. Returns 202 Accepted immediately to Salesforce.
     """
-    logger.info(f"Received trigger for Case ID: {payload.case_id}")
+    logger.info(f"Incoming request from Salesforce for Case: {payload.case_id}")
     
     if not payload.case_id:
         raise HTTPException(
-            status_code=400, 
-            detail="Missing case_id in payload"
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Missing required Case ID."
         )
 
-    # Hand off the heavy lifting to the background worker
-    # In a full Azure setup, this task would be pushed to Azure Service Bus here
-    background_tasks.add_task(orchestrator.run_closed_loop, payload.case_id)
-    
-    return {
-        "message": "Case received and analysis initiated",
-        "case_id": payload.case_id
-    }
+    try:
+        # Step 1: Push to Queue
+        # This ensures the 'state' of the work is saved in Azure cloud
+        sender = sb_client.get_queue_sender(queue_name="case-inbound-queue")
+        async with sender:
+            message = ServiceBusMessage(payload.case_id)
+            await sender.send_messages(message)
+            logger.info(f"Case {payload.case_id} successfully persisted to Service Bus.")
+        
+        # Step 2: Immediate Acknowledgment
+        # Salesforce receives this and closes the connection, satisfied the task is 'Handed Off'
+        return {
+            "status": "accepted",
+            "message": "Case queued for background analysis",
+            "case_id": payload.case_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Persistence Failure for Case {payload.case_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="System failed to persist case data. Logic loop interrupted."
+        )
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for Azure App Service monitoring."""
+    return {"status": "up", "persistence": "active"}
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,40 +1,44 @@
 """
 src/config.py
 Centralized configuration management using Pydantic Settings.
-Ensures all required environment variables are present before execution.
+Loads variables from .env and validates presence of critical keys.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, SecretStr
 
 class Settings(BaseSettings):
     """
-    Application settings mapped to Environment Variables.
-    Values can be provided via a .env file or system env vars.
+    Application settings and environment variables.
+    Pydantic automatically maps uppercase ENV variables to these attributes.
     """
     
-    # --- Salesforce Settings ---
-    vault_url: str = Field(description="Azure Key Vault URL")
-    sf_instance_url: str = Field(description="Salesforce Instance URL")
-    default_tech_id: str = Field(description="Default Salesforce User ID for Task assignment")
-    
-    # --- Azure AI & Search Settings ---
-    azure_search_endpoint: str
-    azure_search_index: str
-    azure_openai_endpoint: str
-    
-    # --- Egress / Notification Settings ---
-    notif_webhook_url: str = Field(description="Slack or Teams Webhook URL")
+    # --- Salesforce Configuration ---
+    sf_instance_url: str = Field(..., alias="SF_INSTANCE_URL")
+    # Using SecretStr prevents accidental logging of sensitive keys
+    sf_client_id: str = Field(..., alias="SF_CLIENT_ID")
+    sf_client_secret: str = Field(..., alias="SF_CLIENT_SECRET")
+    default_tech_id: str = Field("005xxxxxxxxx", alias="DEFAULT_TECH_ID")
 
-    # Configuration for the Settings loader
+    # --- Azure AI & OpenAI Configuration ---
+    azure_openai_endpoint: str = Field(..., alias="AZURE_OPENAI_ENDPOINT")
+    azure_search_endpoint: str = Field(..., alias="AZURE_SEARCH_ENDPOINT")
+    azure_search_index: str = Field("tech-manuals-index", alias="AZURE_SEARCH_INDEX")
+    vault_url: str = Field(..., alias="VAULT_URL")
+
+    # --- Persistence & Notifications (The "Closed-Loop" logic) ---
+    # Connection string for Azure Service Bus Queue
+    sb_conn_str: str = Field(..., alias="SB_CONN_STR")
+    
+    # Webhook for Teams/Slack alerts
+    notif_webhook_url: str = Field(..., alias="NOTIF_WEBHOOK_URL")
+
+    # Configuration for Pydantic to read from a .env file
     model_config = SettingsConfigDict(
-        # Looks for a .env file in the project root
-        env_file=".env",
-        # Ensures variables are case-insensitive (e.g., VAULT_URL or vault_url)
+        env_file=".env", 
         env_file_encoding="utf-8",
-        # Ignores extra environment variables not defined here
-        extra="ignore"
+        extra="ignore" # Ignore extra env vars not defined here
     )
 
-# Instantiate as a singleton to be imported across the project
+# Create a singleton instance to be used across the app
 settings = Settings()
