@@ -7,6 +7,46 @@ This repository contains a production-ready Python implementation of an Agentic 
 
 The solution follows a **Cloud-Native, Async-First** architecture optimized for the Azure ecosystem.
 
+## Deployment & Endpoint Hosting
+To make this agent "live," it is deployed as a FastAPI web service.
+
+Deployment Path: Azure App Service / Functions
+Hosting: The code in app.py is hosted on Azure App Service.
+
+Endpoint: Once deployed, the agent exposes a public URL: https://<your-app-name>.azurewebsites.net/trigger.
+
+Security: The endpoint is secured via Managed Identity, ensuring only authorized triggers (like Salesforce) can initiate the workflow.
+
+### Ingress: Identifying New Cases
+The system identifies a new case via two primary architectural patterns. This implementation is optimized for Method A.
+
+Method A: Push (The "Doorbell" Approach)
+Mechanism: Salesforce "pushes" the data to the Agent's endpoint in real-time.
+
+Setup: A Salesforce Record-Triggered Flow is configured. When a "Technical Fault" case is created, the Flow fires an HTTP Callout to the /trigger endpoint.
+
+Pros: Real-time processing, zero idle compute costs.
+
+Method B: Pull/Polling (The "Mailbox" Approach)
+Mechanism: The Agent "pulls" data by asking Salesforce for new records on a schedule.
+
+Setup: A cron job or Azure Function Timer Trigger runs a SOQL query: SELECT Id FROM Case WHERE Status = 'New' AND Priority = 'High'.
+
+Pros: Easier to manage rate limits; doesn't require a public-facing endpoint for Salesforce to hit.
+
+⚙️ Salesforce Configuration Options
+To trigger this agent, you must configure one of the following within your Salesforce Org:
+
+Option 1: Salesforce Flow (Recommended)
+Trigger: Record-Triggered Flow on Case.
+
+Condition: Status = 'New' AND Type = 'Technical Fault'.
+
+Action: Create an External Service and use an HTTP Callout to send the CaseId to the Python API.
+
+Option 2: Apex Trigger (Pro-Code)
+For complex logic, use an Apex Trigger to invoke an @future or Queueable class that makes an HttpRequest to the Agent's URL.
+
 ### The "Closed-Loop" Workflow
 1.  **Ingress:** A trigger identifies a new "Technical Fault" Case in Salesforce.
 2.  **Context Gathering:** The agent performs **Data Traversal** using the Salesforce REST API to fetch full Case details and associated `Vehicle_History__c`.
