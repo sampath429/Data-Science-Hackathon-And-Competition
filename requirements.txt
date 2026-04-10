@@ -1,0 +1,19 @@
+# --- Core Framework & Validation ---
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+
+# --- Asynchronous HTTP & API Clients ---
+httpx>=0.27.0
+
+# --- Azure Integration & Security ---
+azure-identity>=1.15.0
+azure-keyvault-secrets>=4.7.0
+azure-search-documents==11.4.0
+azure-core>=1.30.0
+
+# --- AI & LLM ---
+openai>=1.12.0
+
+# --- Linting & Formatting (Development) ---
+black>=24.2.0
+ruff>=0.2.2
